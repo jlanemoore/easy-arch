@@ -448,14 +448,36 @@ arch-chroot /mnt /bin/bash -e <<EOF
     
     # Create the boot entry with proper path formatting
     # Note: Backslashes need to be properly escaped for EFI entries
-    DISK_PART=\$(lsblk -no NAME,PARTTYPE "$DISK" | grep "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" | awk '{print \$1}' | head -n 1)
     
-    # Remove partition number to get base device name (for efibootmgr)
-    BASE_DISK=\$(echo "$DISK" | sed 's/[0-9]*\$//')
-    PART_NUM=\$(echo "$DISK_PART" | grep -o '[0-9]*\$')
+    # Handle partition number extraction safely
+    # For /dev/sdX1 style devices
+    if [[ "$DISK" =~ ^/dev/sd[a-z]+[0-9]+$ ]]; then
+        BASE_DISK=\$(echo "$DISK" | sed 's/[0-9]*$//')
+        PART_NUM=\$(echo "$DISK" | grep -o '[0-9]*$')
+    # For /dev/nvmeXn1pY style devices
+    elif [[ "$DISK" =~ ^/dev/nvme[0-9]+n[0-9]+p[0-9]+$ ]]; then
+        BASE_DISK=\$(echo "$DISK" | sed 's/p[0-9]*$//')
+        PART_NUM=\$(echo "$DISK" | grep -o 'p[0-9]*$' | grep -o '[0-9]*')
+    else
+        # Default fallback - use the values directly
+        BASE_DISK="$DISK"
+        PART_NUM=1
+        info_print "Using default partition mapping: $BASE_DISK part $PART_NUM"
+    fi
+    
+    # Verify we have numeric part num
+    if ! [[ "$PART_NUM" =~ ^[0-9]+$ ]]; then
+        echo "Error: Could not determine partition number from $DISK"
+        echo "Using default partition number 1"
+        PART_NUM=1
+    fi
     
     # Build command line with proper escaping
     CMDLINE="rd.luks.name=$UUID=cryptroot root=$BTRFS rootflags=subvol=@ rw quiet"
+    
+    echo "Creating EFI boot entry using:"
+    echo "Disk: $BASE_DISK"
+    echo "Partition: $PART_NUM"
     
     if [ -f /boot/EFI/Linux/$microcode.img ]; then
         efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel)" \
@@ -501,23 +523,26 @@ HOOK
     fi
     
     # Create a fallback entry (important for reliability)
-    if [ -f /boot/EFI/Linux/$microcode.img ]; then
-        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
-            --loader /EFI/Linux/vmlinuz-$kernel \
-            --unicode "initrd=\\\\EFI\\\\Linux\\\\$microcode.img initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
-            --verbose
+    if [ -f /boot/initramfs-$kernel-fallback.img ]; then
+        cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/
+        
+        if [ -f /boot/EFI/Linux/$microcode.img ]; then
+            efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
+                --loader /EFI/Linux/vmlinuz-$kernel \
+                --unicode "initrd=\\\\EFI\\\\Linux\\\\$microcode.img initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
+                --verbose
+        else
+            efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
+                --loader /EFI/Linux/vmlinuz-$kernel \
+                --unicode "initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
+                --verbose
+        fi
+        
+        # Update the hooks to include fallback initramfs
+        sed -i "s|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img \&\& cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/initramfs-$kernel-fallback.img|g" /etc/pacman.d/hooks/90-linux-efistub.hook
     else
-        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
-            --loader /EFI/Linux/vmlinuz-$kernel \
-            --unicode "initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
-            --verbose
+        echo "Warning: Fallback initramfs not found. Creating only primary boot entry."
     fi
-    
-    # Also copy fallback initramfs
-    cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/
-    
-    # Update the hooks to include fallback initramfs
-    sed -i "s|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img \&\& cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/initramfs-$kernel-fallback.img|g" /etc/pacman.d/hooks/90-linux-efistub.hook
 EOF
 # Setting root password.
 info_print "Setting root password."
