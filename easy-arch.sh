@@ -344,7 +344,7 @@ umount /mnt
 info_print "Mounting the newly created subvolumes."
 mountopts="ssd,noatime,compress-force=zstd:3,discard=async"
 mount -o "$mountopts",subvol=@ "$BTRFS" /mnt
-mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot/EFI/Linux}
+mkdir -p /mnt/{home,root,srv,.snapshots,boot,var/{log,cache/pacman/pkg}}
 for subvol in "${subvols[@]:2}"; do
     mount -o "$mountopts",subvol=@"$subvol" "$BTRFS" /mnt/"${subvol//_//}"
 done
@@ -359,7 +359,12 @@ microcode_detector
 
 # Pacstrap (setting up a base sytem onto the new root).
 info_print "Installing the base system (it may take a while)."
-pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs rsync efibootmgr snapper reflector snap-pac zram-generator sudo &>/dev/null
+pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs rsync efibootmgr snapper reflector snap-pac zram-generator sudo 2>&1 | tee /tmp/pacstrap.log
+
+if [ ! -f /mnt/etc/locale.gen ]; then
+    error_print "Pacstrap failed or did not install all necessary packages. Check /tmp/pacstrap.log for details."
+    exit 1
+fi
 
 # Setting up the hostname.
 echo "$hostname" > /mnt/etc/hostname
