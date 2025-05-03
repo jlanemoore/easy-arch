@@ -344,7 +344,7 @@ umount /mnt
 info_print "Mounting the newly created subvolumes."
 mountopts="ssd,noatime,compress-force=zstd:3,discard=async"
 mount -o "$mountopts",subvol=@ "$BTRFS" /mnt
-mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot}
+mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot/EFI/Linux}
 for subvol in "${subvols[@]:2}"; do
     mount -o "$mountopts",subvol=@"$subvol" "$BTRFS" /mnt/"${subvol//_//}"
 done
@@ -359,7 +359,7 @@ microcode_detector
 
 # Pacstrap (setting up a base sytem onto the new root).
 info_print "Installing the base system (it may take a while)."
-pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs grub grub-btrfs rsync efibootmgr snapper reflector snap-pac zram-generator sudo &>/dev/null
+pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs rsync efibootmgr snapper reflector snap-pac zram-generator sudo &>/dev/null
 
 # Setting up the hostname.
 echo "$hostname" > /mnt/etc/hostname
@@ -393,13 +393,11 @@ cat > /mnt/etc/mkinitcpio.conf <<EOF
 HOOKS=(systemd autodetect keyboard sd-vconsole modconf block sd-encrypt filesystems)
 EOF
 
-# Setting up LUKS2 encryption in grub.
-info_print "Setting up grub config."
-UUID=$(blkid -s UUID -o value $CRYPTROOT)
-sed -i "\,^GRUB_CMDLINE_LINUX=\"\",s,\",&rd.luks.name=$UUID=cryptroot root=$BTRFS," /mnt/etc/default/grub
+# Get encryption UUID
+UUID=$(blkid -s UUID -o value "$CRYPTROOT")
 
 # Configuring the system.
-info_print "Configuring the system (timezone, system clock, initramfs, Snapper, GRUB)."
+info_print "Configuring the system (timezone, system clock, initramfs, Snapper)."
 arch-chroot /mnt /bin/bash -e <<EOF
 
     # Setting up timezone.
@@ -423,12 +421,68 @@ arch-chroot /mnt /bin/bash -e <<EOF
     mount -a &>/dev/null
     chmod 750 /.snapshots
 
-    # Installing GRUB.
-    grub-install --target=x86_64-efi --efi-directory=/boot/ --bootloader-id=GRUB &>/dev/null
+EOF
 
-    # Creating grub config file.
-    grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
+# Setting up EFI Stub boot entries
+info_print "Setting up EFI Stub boot entries."
+arch-chroot /mnt /bin/bash -e <<EOF
+    # Get the kernel version
+    KERNEL_VERSION=\$(ls /usr/lib/modules | sort -V | tail -n 1)
+    
+    # Copy the kernel and initramfs to EFI directory with descriptive names
+    cp /usr/lib/modules/\$KERNEL_VERSION/vmlinuz /boot/EFI/Linux/vmlinuz-$kernel
+    cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img
+    
+    # Copy microcode if available
+    if [ -f /boot/$microcode.img ]; then
+        cp /boot/$microcode.img /boot/EFI/Linux/$microcode.img
+    fi
+    
+    # Create the boot entry
+    CMDLINE="rd.luks.name=$UUID=cryptroot root=$BTRFS rootflags=subvol=@ rw quiet"
+    
+    if [ -f /boot/$microcode.img ]; then
+        efibootmgr --create --disk $DISK --part 1 --label "Arch Linux ($kernel)" \
+            --loader /EFI/Linux/vmlinuz-$kernel \
+            --unicode "initrd=\\EFI\\Linux\\$microcode.img initrd=\\EFI\\Linux\\initramfs-$kernel.img $CMDLINE" \
+            --verbose
+    else
+        efibootmgr --create --disk $DISK --part 1 --label "Arch Linux ($kernel)" \
+            --loader /EFI/Linux/vmlinuz-$kernel \
+            --unicode "initrd=\\EFI\\Linux\\initramfs-$kernel.img $CMDLINE" \
+            --verbose
+    fi
+    
+    # Create automatic update hook for kernel
+    mkdir -p /etc/pacman.d/hooks
+    cat > /etc/pacman.d/hooks/90-linux-efistub.hook <<HOOK
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = $kernel
 
+[Action]
+Description = Updating EFI Stub with new kernel
+When = PostTransaction
+Exec = /usr/bin/bash -c 'cp /usr/lib/modules/\$(ls /usr/lib/modules | sort -V | tail -n 1)/vmlinuz /boot/EFI/Linux/vmlinuz-$kernel && cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img'
+HOOK
+    
+    # Create hook for microcode updates
+    if [ -f /boot/$microcode.img ]; then
+        cat > /etc/pacman.d/hooks/91-$microcode-efistub.hook <<HOOK
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = $microcode
+
+[Action]
+Description = Copying $microcode microcode to EFI directory
+When = PostTransaction
+Exec = /usr/bin/bash -c 'cp /boot/$microcode.img /boot/EFI/Linux/$microcode.img'
+HOOK
+    fi
 EOF
 
 # Setting root password.
@@ -446,7 +500,7 @@ fi
 
 # Boot backup hook.
 info_print "Configuring /boot backup when pacman transactions are made."
-mkdir /mnt/etc/pacman.d/hooks
+mkdir -p /mnt/etc/pacman.d/hooks
 cat > /mnt/etc/pacman.d/hooks/50-bootbackup.hook <<EOF
 [Trigger]
 Operation = Upgrade
@@ -475,7 +529,7 @@ sed -Ei 's/^#(Color)$/\1\nILoveCandy/;s/^#(ParallelDownloads).*/\1 = 10/' /mnt/e
 
 # Enabling various services.
 info_print "Enabling Reflector, automatic snapshots, BTRFS scrubbing and systemd-oomd."
-services=(reflector.timer snapper-timeline.timer snapper-cleanup.timer btrfs-scrub@-.timer btrfs-scrub@home.timer btrfs-scrub@var-log.timer btrfs-scrub@\\x2esnapshots.timer grub-btrfsd.service systemd-oomd)
+services=(reflector.timer snapper-timeline.timer snapper-cleanup.timer btrfs-scrub@-.timer btrfs-scrub@home.timer btrfs-scrub@var-log.timer btrfs-scrub@\\x2esnapshots.timer systemd-oomd)
 for service in "${services[@]}"; do
     systemctl enable "$service" --root=/mnt &>/dev/null
 done
