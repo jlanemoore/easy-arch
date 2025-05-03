@@ -344,7 +344,7 @@ umount /mnt
 info_print "Mounting the newly created subvolumes."
 mountopts="ssd,noatime,compress-force=zstd:3,discard=async"
 mount -o "$mountopts",subvol=@ "$BTRFS" /mnt
-mkdir -p /mnt/{home,root,srv,.snapshots,var/{log,cache/pacman/pkg},boot/EFI/Linux}
+mkdir -p /mnt/{home,root,srv,.snapshots,boot,var/{log,cache/pacman/pkg}}
 for subvol in "${subvols[@]:2}"; do
     mount -o "$mountopts",subvol=@"$subvol" "$BTRFS" /mnt/"${subvol//_//}"
 done
@@ -359,7 +359,12 @@ microcode_detector
 
 # Pacstrap (setting up a base sytem onto the new root).
 info_print "Installing the base system (it may take a while)."
-pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs rsync efibootmgr snapper reflector snap-pac zram-generator sudo &>/dev/null
+pacstrap -K /mnt base "$kernel" "$microcode" linux-firmware "$kernel"-headers btrfs-progs rsync efibootmgr snapper reflector snap-pac zram-generator sudo 2>&1 | tee /tmp/pacstrap.log
+
+if [ ! -f /mnt/etc/locale.gen ]; then
+    error_print "Pacstrap failed or did not install all necessary packages. Check /tmp/pacstrap.log for details."
+    exit 1
+fi
 
 # Setting up the hostname.
 echo "$hostname" > /mnt/etc/hostname
@@ -429,6 +434,9 @@ arch-chroot /mnt /bin/bash -e <<EOF
     # Get the kernel version
     KERNEL_VERSION=\$(ls /usr/lib/modules | sort -V | tail -n 1)
     
+    # Create necessary directories
+    mkdir -p /boot/EFI/Linux
+    
     # Copy the kernel and initramfs to EFI directory with descriptive names
     cp /usr/lib/modules/\$KERNEL_VERSION/vmlinuz /boot/EFI/Linux/vmlinuz-$kernel
     cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img
@@ -438,18 +446,26 @@ arch-chroot /mnt /bin/bash -e <<EOF
         cp /boot/$microcode.img /boot/EFI/Linux/$microcode.img
     fi
     
-    # Create the boot entry
+    # Create the boot entry with proper path formatting
+    # Note: Backslashes need to be properly escaped for EFI entries
+    DISK_PART=\$(lsblk -no NAME,PARTTYPE "$DISK" | grep "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" | awk '{print \$1}' | head -n 1)
+    
+    # Remove partition number to get base device name (for efibootmgr)
+    BASE_DISK=\$(echo "$DISK" | sed 's/[0-9]*\$//')
+    PART_NUM=\$(echo "$DISK_PART" | grep -o '[0-9]*\$')
+    
+    # Build command line with proper escaping
     CMDLINE="rd.luks.name=$UUID=cryptroot root=$BTRFS rootflags=subvol=@ rw quiet"
     
-    if [ -f /boot/$microcode.img ]; then
-        efibootmgr --create --disk $DISK --part 1 --label "Arch Linux ($kernel)" \
+    if [ -f /boot/EFI/Linux/$microcode.img ]; then
+        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel)" \
             --loader /EFI/Linux/vmlinuz-$kernel \
-            --unicode "initrd=\\EFI\\Linux\\$microcode.img initrd=\\EFI\\Linux\\initramfs-$kernel.img $CMDLINE" \
+            --unicode "initrd=\\\\EFI\\\\Linux\\\\$microcode.img initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel.img $CMDLINE" \
             --verbose
     else
-        efibootmgr --create --disk $DISK --part 1 --label "Arch Linux ($kernel)" \
+        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel)" \
             --loader /EFI/Linux/vmlinuz-$kernel \
-            --unicode "initrd=\\EFI\\Linux\\initramfs-$kernel.img $CMDLINE" \
+            --unicode "initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel.img $CMDLINE" \
             --verbose
     fi
     
@@ -483,8 +499,26 @@ When = PostTransaction
 Exec = /usr/bin/bash -c 'cp /boot/$microcode.img /boot/EFI/Linux/$microcode.img'
 HOOK
     fi
+    
+    # Create a fallback entry (important for reliability)
+    if [ -f /boot/EFI/Linux/$microcode.img ]; then
+        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
+            --loader /EFI/Linux/vmlinuz-$kernel \
+            --unicode "initrd=\\\\EFI\\\\Linux\\\\$microcode.img initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
+            --verbose
+    else
+        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
+            --loader /EFI/Linux/vmlinuz-$kernel \
+            --unicode "initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
+            --verbose
+    fi
+    
+    # Also copy fallback initramfs
+    cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/
+    
+    # Update the hooks to include fallback initramfs
+    sed -i "s|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img \&\& cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/initramfs-$kernel-fallback.img|g" /etc/pacman.d/hooks/90-linux-efistub.hook
 EOF
-
 # Setting root password.
 info_print "Setting root password."
 echo "root:$rootpass" | arch-chroot /mnt chpasswd
