@@ -430,120 +430,157 @@ EOF
 
 # Setting up EFI Stub boot entries
 info_print "Setting up EFI Stub boot entries."
-arch-chroot /mnt /bin/bash -e <<EOF
-    # Get the kernel version
-    KERNEL_VERSION=\$(ls /usr/lib/modules | sort -V | tail -n 1)
+
+# Create the EFI directory structure outside of chroot
+mkdir -p /mnt/boot/EFI/Linux
+
+# Create a separate script file to run inside chroot
+cat > /mnt/efi_setup.sh <<'EOFSCRIPT'
+#!/bin/bash
+
+# Set error handling
+set -e
+
+# Get kernel version
+KERNEL_VERSION=$(ls /usr/lib/modules | sort -V | tail -n 1)
+
+# Determine kernel and microcode from files
+KERNEL=$(basename $(ls -1 /boot/vmlinuz-* | head -n1) | sed 's/vmlinuz-//')
+MICROCODE=""
+[[ -f /boot/intel-ucode.img ]] && MICROCODE="intel-ucode"
+[[ -f /boot/amd-ucode.img ]] && MICROCODE="amd-ucode"
+
+echo "Using kernel: $KERNEL"
+echo "Using microcode: $MICROCODE"
+
+# Copy kernel files
+echo "Copying kernel and initramfs to EFI directory"
+cp /usr/lib/modules/$KERNEL_VERSION/vmlinuz /boot/EFI/Linux/vmlinuz-$KERNEL
+cp /boot/initramfs-$KERNEL.img /boot/EFI/Linux/initramfs-$KERNEL.img
+
+# Copy microcode if available
+if [[ -n "$MICROCODE" && -f /boot/$MICROCODE.img ]]; then
+    echo "Copying microcode to EFI directory"
+    cp /boot/$MICROCODE.img /boot/EFI/Linux/$MICROCODE.img
+fi
+
+# Get root device info
+ROOT_DEVICE=$(findmnt -no SOURCE / | sed 's/\[.*\]//g')
+echo "Root device: $ROOT_DEVICE"
+
+# Get LUKS UUID if encrypted
+if [[ -L /dev/mapper/cryptroot ]]; then
+    LUKS_DEVICE=$(cryptsetup status cryptroot | grep device | awk '{print $2}')
+    LUKS_UUID=$(blkid -s UUID -o value "$LUKS_DEVICE")
+    echo "LUKS UUID: $LUKS_UUID"
+    CMDLINE="rd.luks.name=$LUKS_UUID=cryptroot root=$ROOT_DEVICE rootflags=subvol=@ rw quiet"
+else
+    echo "No LUKS encryption detected"
+    CMDLINE="root=$ROOT_DEVICE rootflags=subvol=@ rw quiet"
+fi
+
+echo "Boot command line: $CMDLINE"
+
+# Find EFI partition
+EFI_PART=$(findmnt -no SOURCE /boot | sed 's/\[.*\]//g')
+if [[ "$EFI_PART" == /dev/sd* ]]; then
+    # Handle standard disks like /dev/sda1
+    BASE_DISK=$(echo "$EFI_PART" | sed 's/[0-9]*$//')
+    PART_NUM=$(echo "$EFI_PART" | grep -o '[0-9]*$')
+elif [[ "$EFI_PART" == /dev/nvme* ]]; then
+    # Handle NVMe disks like /dev/nvme0n1p1
+    BASE_DISK=$(echo "$EFI_PART" | sed 's/p[0-9]*$//')
+    PART_NUM=$(echo "$EFI_PART" | grep -o 'p[0-9]*$' | grep -o '[0-9]*')
+else
+    echo "Unknown disk format: $EFI_PART"
+    echo "Using defaults"
+    BASE_DISK="$EFI_PART"
+    PART_NUM=1
+fi
+
+echo "Using disk: $BASE_DISK part: $PART_NUM"
+
+# Create EFI boot entries
+echo "Creating EFI boot entries"
+if [[ -n "$MICROCODE" && -f /boot/EFI/Linux/$MICROCODE.img ]]; then
+    efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($KERNEL)" \
+        --loader /EFI/Linux/vmlinuz-$KERNEL \
+        --unicode "initrd=\\EFI\\Linux\\$MICROCODE.img initrd=\\EFI\\Linux\\initramfs-$KERNEL.img $CMDLINE" \
+        --verbose
+else
+    efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($KERNEL)" \
+        --loader /EFI/Linux/vmlinuz-$KERNEL \
+        --unicode "initrd=\\EFI\\Linux\\initramfs-$KERNEL.img $CMDLINE" \
+        --verbose
+fi
+
+# Handle fallback initramfs
+if [[ -f /boot/initramfs-$KERNEL-fallback.img ]]; then
+    echo "Creating fallback boot entry"
+    cp /boot/initramfs-$KERNEL-fallback.img /boot/EFI/Linux/
     
-    # Create necessary directories
-    mkdir -p /boot/EFI/Linux
-    
-    # Copy the kernel and initramfs to EFI directory with descriptive names
-    cp /usr/lib/modules/\$KERNEL_VERSION/vmlinuz /boot/EFI/Linux/vmlinuz-$kernel
-    cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img
-    
-    # Copy microcode if available
-    if [ -f /boot/$microcode.img ]; then
-        cp /boot/$microcode.img /boot/EFI/Linux/$microcode.img
-    fi
-    
-    # Create the boot entry with proper path formatting
-    # Note: Backslashes need to be properly escaped for EFI entries
-    
-    # Handle partition number extraction safely
-    # For /dev/sdX1 style devices
-    if [[ "$DISK" =~ ^/dev/sd[a-z]+[0-9]+$ ]]; then
-        BASE_DISK=\$(echo "$DISK" | sed 's/[0-9]*$//')
-        PART_NUM=\$(echo "$DISK" | grep -o '[0-9]*$')
-    # For /dev/nvmeXn1pY style devices
-    elif [[ "$DISK" =~ ^/dev/nvme[0-9]+n[0-9]+p[0-9]+$ ]]; then
-        BASE_DISK=\$(echo "$DISK" | sed 's/p[0-9]*$//')
-        PART_NUM=\$(echo "$DISK" | grep -o 'p[0-9]*$' | grep -o '[0-9]*')
-    else
-        # Default fallback - use the values directly
-        BASE_DISK="$DISK"
-        PART_NUM=1
-        info_print "Using default partition mapping: $BASE_DISK part $PART_NUM"
-    fi
-    
-    # Verify we have numeric part num
-    if ! [[ "$PART_NUM" =~ ^[0-9]+$ ]]; then
-        echo "Error: Could not determine partition number from $DISK"
-        echo "Using default partition number 1"
-        PART_NUM=1
-    fi
-    
-    # Build command line with proper escaping
-    CMDLINE="rd.luks.name=$UUID=cryptroot root=$BTRFS rootflags=subvol=@ rw quiet"
-    
-    echo "Creating EFI boot entry using:"
-    echo "Disk: $BASE_DISK"
-    echo "Partition: $PART_NUM"
-    
-    if [ -f /boot/EFI/Linux/$microcode.img ]; then
-        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel)" \
-            --loader /EFI/Linux/vmlinuz-$kernel \
-            --unicode "initrd=\\\\EFI\\\\Linux\\\\$microcode.img initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel.img $CMDLINE" \
+    if [[ -n "$MICROCODE" && -f /boot/EFI/Linux/$MICROCODE.img ]]; then
+        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($KERNEL) Fallback" \
+            --loader /EFI/Linux/vmlinuz-$KERNEL \
+            --unicode "initrd=\\EFI\\Linux\\$MICROCODE.img initrd=\\EFI\\Linux\\initramfs-$KERNEL-fallback.img $CMDLINE" \
             --verbose
     else
-        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel)" \
-            --loader /EFI/Linux/vmlinuz-$kernel \
-            --unicode "initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel.img $CMDLINE" \
+        efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($KERNEL) Fallback" \
+            --loader /EFI/Linux/vmlinuz-$KERNEL \
+            --unicode "initrd=\\EFI\\Linux\\initramfs-$KERNEL-fallback.img $CMDLINE" \
             --verbose
     fi
-    
-    # Create automatic update hook for kernel
-    mkdir -p /etc/pacman.d/hooks
-    cat > /etc/pacman.d/hooks/90-linux-efistub.hook <<HOOK
+fi
+
+# Create pacman hooks
+echo "Creating pacman hooks"
+mkdir -p /etc/pacman.d/hooks
+
+# Kernel update hook
+cat > /etc/pacman.d/hooks/90-linux-efistub.hook <<EOF
 [Trigger]
 Type = Package
 Operation = Install
 Operation = Upgrade
-Target = $kernel
+Target = $KERNEL
 
 [Action]
 Description = Updating EFI Stub with new kernel
 When = PostTransaction
-Exec = /usr/bin/bash -c 'cp /usr/lib/modules/\$(ls /usr/lib/modules | sort -V | tail -n 1)/vmlinuz /boot/EFI/Linux/vmlinuz-$kernel && cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img'
-HOOK
-    
-    # Create hook for microcode updates
-    if [ -f /boot/$microcode.img ]; then
-        cat > /etc/pacman.d/hooks/91-$microcode-efistub.hook <<HOOK
+Exec = /usr/bin/bash -c 'cp /usr/lib/modules/\$(ls /usr/lib/modules | sort -V | tail -n 1)/vmlinuz /boot/EFI/Linux/vmlinuz-$KERNEL && cp /boot/initramfs-$KERNEL.img /boot/EFI/Linux/initramfs-$KERNEL.img $([ -f /boot/initramfs-$KERNEL-fallback.img ] && echo "&& cp /boot/initramfs-$KERNEL-fallback.img /boot/EFI/Linux/initramfs-$KERNEL-fallback.img")'
+EOF
+
+# Microcode update hook
+if [[ -n "$MICROCODE" ]]; then
+    cat > /etc/pacman.d/hooks/91-$MICROCODE-efistub.hook <<EOF
 [Trigger]
 Type = Package
 Operation = Install
 Operation = Upgrade
-Target = $microcode
+Target = $MICROCODE
 
 [Action]
-Description = Copying $microcode microcode to EFI directory
+Description = Copying $MICROCODE microcode to EFI directory
 When = PostTransaction
-Exec = /usr/bin/bash -c 'cp /boot/$microcode.img /boot/EFI/Linux/$microcode.img'
-HOOK
-    fi
-    
-    # Create a fallback entry (important for reliability)
-    if [ -f /boot/initramfs-$kernel-fallback.img ]; then
-        cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/
-        
-        if [ -f /boot/EFI/Linux/$microcode.img ]; then
-            efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
-                --loader /EFI/Linux/vmlinuz-$kernel \
-                --unicode "initrd=\\\\EFI\\\\Linux\\\\$microcode.img initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
-                --verbose
-        else
-            efibootmgr --create --disk "$BASE_DISK" --part "$PART_NUM" --label "Arch Linux ($kernel) Fallback" \
-                --loader /EFI/Linux/vmlinuz-$kernel \
-                --unicode "initrd=\\\\EFI\\\\Linux\\\\initramfs-$kernel-fallback.img $CMDLINE" \
-                --verbose
-        fi
-        
-        # Update the hooks to include fallback initramfs
-        sed -i "s|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img|cp /boot/initramfs-$kernel.img /boot/EFI/Linux/initramfs-$kernel.img \&\& cp /boot/initramfs-$kernel-fallback.img /boot/EFI/Linux/initramfs-$kernel-fallback.img|g" /etc/pacman.d/hooks/90-linux-efistub.hook
-    else
-        echo "Warning: Fallback initramfs not found. Creating only primary boot entry."
-    fi
+Exec = /usr/bin/bash -c 'cp /boot/$MICROCODE.img /boot/EFI/Linux/$MICROCODE.img'
 EOF
+fi
+
+echo "EFI Stub setup complete"
+EOFSCRIPT
+
+# Make the script executable
+chmod +x /mnt/efi_setup.sh
+
+# Execute the script inside chroot
+info_print "Running EFI setup script in chroot environment"
+arch-chroot /mnt /efi_setup.sh
+
+# Clean up the script
+# rm /mnt/efi_setup.sh
+
+info_print "EFI Stub setup completed successfully"
+
 # Setting root password.
 info_print "Setting root password."
 echo "root:$rootpass" | arch-chroot /mnt chpasswd
